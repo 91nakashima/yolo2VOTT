@@ -48,6 +48,7 @@ from utils.general import (LOGGER, Profile, check_file, check_img_size, check_im
                            increment_path, non_max_suppression, print_args, scale_boxes, strip_optimizer, xyxy2xywh)
 from utils.plots import Annotator, colors, save_one_box
 from utils.torch_utils import select_device, smart_inference_mode
+from vott.main import AutoVottAnnotation, del_vott_json
 
 
 @smart_inference_mode()
@@ -79,6 +80,7 @@ def run(
         half=False,  # use FP16 half-precision inference
         dnn=False,  # use OpenCV DNN for ONNX inference
         vid_stride=1,  # video frame-rate stride
+        is_vott=False,  # is VoTT json format
 ):
     source = str(source)
     save_img = not nosave and not source.endswith('.txt')  # save inference images
@@ -89,9 +91,16 @@ def run(
     if is_url and is_file:
         source = check_file(source)  # download
 
+    if is_url and is_file:
+        source = check_file(source)  # download
+
+    if is_vott:
+        del_vott_json(source)
+
     # Directories
-    save_dir = increment_path(Path(project) / name, exist_ok=exist_ok)  # increment run
-    (save_dir / 'labels' if save_txt else save_dir).mkdir(parents=True, exist_ok=True)  # make dir
+    if not is_vott:
+        save_dir = increment_path(Path(project) / name, exist_ok=exist_ok)  # increment run
+        (save_dir / 'labels' if save_txt else save_dir).mkdir(parents=True, exist_ok=True)  # make dir
 
     # Load model
     device = select_device(device)
@@ -124,8 +133,9 @@ def run(
 
         # Inference
         with dt[1]:
-            visualize = increment_path(save_dir / Path(path).stem, mkdir=True) if visualize else False
-            pred = model(im, augment=augment, visualize=visualize)
+            if not is_vott:
+                visualize = increment_path(save_dir / Path(path).stem, mkdir=True) if visualize else False
+            pred = model(im, augment=augment, visualize=False if is_vott else visualize)
 
         # NMS
         with dt[2]:
@@ -143,13 +153,18 @@ def run(
             else:
                 p, im0, frame = path, im0s.copy(), getattr(dataset, 'frame', 0)
 
-            p = Path(p)  # to Path
-            save_path = str(save_dir / p.name)  # im.jpg
-            txt_path = str(save_dir / 'labels' / p.stem) + ('' if dataset.mode == 'image' else f'_{frame}')  # im.txt
+            if not is_vott:
+                p = Path(p)  # to Path
+                save_path = str(save_dir / p.name)  # im.jpg
+                txt_path = str(save_dir / 'labels' / p.stem) + ('' if dataset.mode == 'image' else f'_{frame}')  # im.txt
             s += '%gx%g ' % im.shape[2:]  # print string
             gn = torch.tensor(im0.shape)[[1, 0, 1, 0]]  # normalization gain whwh
             imc = im0.copy() if save_crop else im0  # for save_crop
             annotator = Annotator(im0, line_width=line_thickness, example=str(names))
+
+            vott = AutoVottAnnotation(img_path=path)
+
+
             if len(det):
                 # Rescale boxes from img_size to im0 size
                 det[:, :4] = scale_boxes(im.shape[2:], det[:, :4], im0.shape).round()
@@ -161,6 +176,13 @@ def run(
 
                 # Write results
                 for *xyxy, conf, cls in reversed(det):
+                    if is_vott:  # vottの場合
+                        xyxy_list = torch.tensor(xyxy).view(1, 4).tolist()
+                        c = int(cls)  # integer class
+                        label = None if hide_labels else names[c]
+                        vott.add_regions(label, xyxy_list[0])
+                        continue
+
                     if save_txt:  # Write to file
                         xywh = (xyxy2xywh(torch.tensor(xyxy).view(1, 4)) / gn).view(-1).tolist()  # normalized xywh
                         line = (cls, *xywh, conf) if save_conf else (cls, *xywh)  # label format
@@ -174,9 +196,13 @@ def run(
                     if save_crop:
                         save_one_box(xyxy, imc, file=save_dir / 'crops' / names[c] / f'{p.stem}.jpg', BGR=True)
 
+                if is_vott:
+                    vott.save()
+                    continue
+
             # Stream results
             im0 = annotator.result()
-            if view_img:
+            if view_img and not is_vott:
                 if platform.system() == 'Linux' and p not in windows:
                     windows.append(p)
                     cv2.namedWindow(str(p), cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)  # allow window resize (Linux)
@@ -185,7 +211,7 @@ def run(
                 cv2.waitKey(1)  # 1 millisecond
 
             # Save results (image with detections)
-            if save_img:
+            if save_img and not is_vott:
                 if dataset.mode == 'image':
                     cv2.imwrite(save_path, im0)
                 else:  # 'video' or 'stream'
@@ -209,7 +235,7 @@ def run(
     # Print results
     t = tuple(x.t / seen * 1E3 for x in dt)  # speeds per image
     LOGGER.info(f'Speed: %.1fms pre-process, %.1fms inference, %.1fms NMS per image at shape {(1, 3, *imgsz)}' % t)
-    if save_txt or save_img:
+    if (save_txt or save_img) and not is_vott:
         s = f"\n{len(list(save_dir.glob('labels/*.txt')))} labels saved to {save_dir / 'labels'}" if save_txt else ''
         LOGGER.info(f"Results saved to {colorstr('bold', save_dir)}{s}")
     if update:
@@ -245,6 +271,7 @@ def parse_opt():
     parser.add_argument('--half', action='store_true', help='use FP16 half-precision inference')
     parser.add_argument('--dnn', action='store_true', help='use OpenCV DNN for ONNX inference')
     parser.add_argument('--vid-stride', type=int, default=1, help='video frame-rate stride')
+    parser.add_argument('--is-vott', action='store_true')
     opt = parser.parse_args()
     opt.imgsz *= 2 if len(opt.imgsz) == 1 else 1  # expand
     print_args(vars(opt))
